@@ -76,6 +76,11 @@ print_stat() {
     printf "${BOLD}${BLUE}│${NC}    %-20s ${BOLD}%s${NC}\n" "$label" "$value"
 }
 
+print_detail() {
+    local text="$1"
+    echo -e "${BOLD}${BLUE}│${NC}      ${DIM}${text}${NC}"
+}
+
 print_footer() {
     local warn_count=${#WARNINGS[@]}
     local sugg_count=${#SUGGESTIONS[@]}
@@ -176,21 +181,17 @@ check_firewall() {
         if [[ "$ufw_status" == *"active"* ]]; then
             print_item "UFW" "ok" "active"
 
-            # Count open ports
-            local open_ports=$(ufw status | grep -c "ALLOW" || echo "0")
-            print_item "Open Ports (UFW)" "ok" "$open_ports rules"
+            # Show open ports with details
+            local open_ports=$(ufw status | grep "ALLOW" | grep -v "(v6)" | awk '{print $1}' | tr '\n' ' ')
+            if [[ -n "$open_ports" ]]; then
+                print_detail "Allowed: ${open_ports}"
+            fi
         else
             print_item "UFW" "fail" "inactive"
             WARNINGS+=("UFW firewall is not active")
         fi
     else
         print_item "UFW" "warn" "not installed"
-    fi
-
-    # Check iptables rules count
-    if command -v iptables &> /dev/null; then
-        local ipt_rules=$(iptables -L -n 2>/dev/null | grep -c "^[A-Z]" || echo "0")
-        print_item "iptables" "ok" "$ipt_rules chains"
     fi
 }
 
@@ -273,8 +274,13 @@ check_compromise() {
         else
             print_item "SSH keys" "warn" "$key_count keys (review)"
             SUGGESTIONS+=("Review authorized SSH keys")
-            ((issues++)) || true || true
+            ((issues++)) || true
         fi
+        # Show key comments (last field)
+        grep "^ssh-" "$auth_keys" 2>/dev/null | while read -r line; do
+            local comment=$(echo "$line" | awk '{print $NF}')
+            print_detail "→ ${comment}"
+        done
     else
         print_item "SSH keys" "ok" "no keys file"
     fi
@@ -283,6 +289,18 @@ check_compromise() {
     local cron_jobs=$(crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" | wc -l)
     local system_crons=$(ls /etc/cron.d/ 2>/dev/null | grep -v "^\\." | wc -l)
     print_item "Cron jobs" "ok" "$cron_jobs user, $system_crons system"
+    # Show user cron details
+    if [[ "$cron_jobs" -gt 0 ]]; then
+        crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" | while read -r line; do
+            local cmd=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf $i" "; print ""}' | cut -c1-50)
+            print_detail "→ ${cmd}"
+        done
+    fi
+    # Show system cron names
+    if [[ "$system_crons" -gt 0 ]]; then
+        local cron_names=$(ls /etc/cron.d/ 2>/dev/null | grep -v "^\\." | tr '\n' ' ')
+        print_detail "System: ${cron_names}"
+    fi
 
     # Check for suspicious processes (crypto miners, etc.)
     local suspicious_procs=$(ps aux 2>/dev/null | grep -iE "(xmrig|minerd|cryptonight|stratum)" | grep -v grep | wc -l)
@@ -297,10 +315,45 @@ check_compromise() {
     # Check for unusual network connections
     local outbound=$(ss -tunap 2>/dev/null | grep ESTAB | grep -v "127.0.0.1\|::1" | wc -l)
     print_item "Outbound connections" "ok" "$outbound active"
+    # Show connection details
+    ss -tunap 2>/dev/null | grep ESTAB | grep -v "127.0.0.1\|::1" | while read -r line; do
+        local proc=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' || echo "unknown")
+        local remote=$(echo "$line" | awk '{print $6}')
+        # Clean up IPv6-mapped IPv4 addresses
+        remote=$(echo "$remote" | sed 's/\[::ffff://' | sed 's/\]//' | sed 's/::ffff://')
+        print_detail "→ ${proc} → ${remote}"
+    done
 
     # Check last logins for unusual IPs
     local unique_ips=$(last -ai 2>/dev/null | grep -v "reboot\|wtmp\|^$" | awk '{print $NF}' | sort -u | wc -l)
     print_item "Unique login IPs" "ok" "$unique_ips (last month)"
+
+    # Get top IPs with counts
+    local top_ips=$(last -ai 2>/dev/null | grep -v "reboot\|wtmp\|^$" | awk '{print $NF}' | sort | uniq -c | sort -rn | head -5)
+    local most_common_ip=$(echo "$top_ips" | head -1 | awk '{print $2}')
+
+    # Show top login IPs with GeoIP info
+    echo "$top_ips" | while read -r count ip; do
+        # Skip invalid IPs
+        [[ -z "$ip" || "$ip" == "0.0.0.0" ]] && continue
+
+        # Get GeoIP info (with timeout)
+        local geoinfo=$(curl -s --max-time 2 "http://ip-api.com/json/${ip}?fields=countryCode,isp,mobile" 2>/dev/null)
+
+        if [[ -n "$geoinfo" && "$geoinfo" != *"fail"* ]]; then
+            local country=$(echo "$geoinfo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4)
+            local isp=$(echo "$geoinfo" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4 | cut -c1-20)
+            local mobile=$(echo "$geoinfo" | grep -o '"mobile":[^,}]*' | cut -d':' -f2)
+
+            local tag=""
+            [[ "$mobile" == "true" ]] && tag=" [Mobile]"
+            [[ "$count" -eq 1 ]] && tag="${tag} [NEW]"
+
+            print_detail "→ ${ip} (${count}x) ${country}, ${isp}${tag}"
+        else
+            print_detail "→ ${ip} (${count}x)"
+        fi
+    done
 
     if [[ $issues -eq 0 ]]; then
         RESULTS[compromise]="clean"
