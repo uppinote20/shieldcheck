@@ -22,7 +22,20 @@ NC='\033[0m' # No Color
 CHECK="✓"
 CROSS="✗"
 WARN="!"
-ARROW="→"
+
+# Constants
+readonly MAX_DETAIL_LENGTH=60
+readonly MAX_CRON_DISPLAY=50
+readonly GEOIP_TIMEOUT=1.5
+readonly MAX_LOGIN_IPS_DISPLAY=3
+readonly GEOIP_CACHE_DIR="/tmp/shieldcheck_geoip"
+readonly GEOIP_API="https://ipinfo.io"
+
+# Global variables
+VERBOSITY="normal"  # minimal, normal, verbose
+DISABLE_GEOIP=false
+GEOIP_AVAILABLE=true
+GEOIP_ERROR_SHOWN=false
 
 # Results storage
 declare -A RESULTS
@@ -76,6 +89,83 @@ print_stat() {
     printf "${BOLD}${BLUE}│${NC}    %-20s ${BOLD}%s${NC}\n" "$label" "$value"
 }
 
+print_detail() {
+    local text="$1"
+    echo -e "${BOLD}${BLUE}│${NC}      ${DIM}${text}${NC}"
+}
+
+#######################################
+# Security and utility functions
+#######################################
+
+# IP validation
+is_valid_ip() {
+    local ip="$1"
+    [[ -z "$ip" || "$ip" == "0.0.0.0" ]] && return 1
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0
+    return 1
+}
+
+# Output sanitization
+sanitize_output() {
+    local text="$1"
+    echo "$text" | tr -cd '[:alnum:][:space:][:punct:]' | cut -c1-50
+}
+
+# GeoIP caching
+get_cached_geoip() {
+    local ip="$1"
+    local cache_file="${GEOIP_CACHE_DIR}/${ip}"
+
+    # Check if cache exists and is less than 24 hours old
+    if [[ -f "$cache_file" ]] && [[ $(find "$cache_file" -mtime -1 2>/dev/null) ]]; then
+        cat "$cache_file"
+        return 0
+    fi
+
+    # Skip if GeoIP is known to be unavailable
+    [[ "$GEOIP_AVAILABLE" == "false" ]] && return 1
+
+    # Fetch and cache
+    local result=$(curl -s --max-time ${GEOIP_TIMEOUT} "${GEOIP_API}/${ip}/json" 2>/dev/null)
+
+    if [[ -z "$result" ]] || [[ "$result" == *"error"* ]] || [[ "$result" == *"bogon"* ]]; then
+        GEOIP_AVAILABLE=false
+        return 1
+    fi
+
+    mkdir -p "$GEOIP_CACHE_DIR"
+    echo "$result" > "$cache_file"
+    echo "$result"
+    return 0
+}
+
+# Parsing functions
+extract_comment_from_key() {
+    echo "$1" | awk '{print $NF}' | cut -c1-${MAX_DETAIL_LENGTH}
+}
+
+extract_cron_command() {
+    echo "$1" | awk '{for(i=6;i<=NF;i++) printf $i" "; print ""}' | cut -c1-${MAX_CRON_DISPLAY}
+}
+
+extract_remote_address() {
+    echo "$1" | awk '{print $6}' | sed 's/\[::ffff://; s/\]//; s/::ffff://'
+}
+
+extract_process_name() {
+    echo "$1" | grep -oP 'users:\(\("\K[^"]+' || echo "unknown"
+}
+
+# Verbosity checks
+show_details() {
+    [[ "$VERBOSITY" != "minimal" ]]
+}
+
+show_verbose_details() {
+    [[ "$VERBOSITY" == "verbose" ]]
+}
+
 print_footer() {
     local warn_count=${#WARNINGS[@]}
     local sugg_count=${#SUGGESTIONS[@]}
@@ -89,19 +179,48 @@ print_footer() {
         if [[ $warn_count -gt 0 ]]; then
             echo -e "${BOLD}${BLUE}│${NC}  ${YELLOW}${WARN} Warnings: ${warn_count}${NC}"
             for w in "${WARNINGS[@]}"; do
-                echo -e "${BOLD}${BLUE}│${NC}    ${DIM}${ARROW} ${w}${NC}"
+                echo -e "${BOLD}${BLUE}│${NC}    ${DIM}→ ${w}${NC}"
             done
         fi
         if [[ $sugg_count -gt 0 ]]; then
             echo -e "${BOLD}${BLUE}│${NC}  ${CYAN}💡 Suggestions: ${sugg_count}${NC}"
             for s in "${SUGGESTIONS[@]}"; do
-                echo -e "${BOLD}${BLUE}│${NC}    ${DIM}${ARROW} ${s}${NC}"
+                echo -e "${BOLD}${BLUE}│${NC}    ${DIM}→ ${s}${NC}"
             done
         fi
     fi
 
     echo -e "${BOLD}${BLUE}└─────────────────────────────────────────────────────────────┘${NC}"
     echo ""
+}
+
+show_help() {
+    cat << EOF
+Usage: shieldcheck [OPTIONS]
+
+Quick Linux server security status check tool
+
+OPTIONS:
+    -q, --quiet      Minimal output (counts only, no details)
+    -v, --verbose    Verbose output (full details including GeoIP)
+    --no-geoip       Disable external GeoIP lookups
+    -h, --help       Show this help message
+
+EXAMPLES:
+    # Quick check (default)
+    sudo shieldcheck
+
+    # Minimal output (for scripting)
+    sudo shieldcheck --quiet
+
+    # Full details with GeoIP
+    sudo shieldcheck --verbose
+
+    # Run without GeoIP
+    sudo shieldcheck --no-geoip
+
+EOF
+    exit 0
 }
 
 #######################################
@@ -176,21 +295,17 @@ check_firewall() {
         if [[ "$ufw_status" == *"active"* ]]; then
             print_item "UFW" "ok" "active"
 
-            # Count open ports
-            local open_ports=$(ufw status | grep -c "ALLOW" || echo "0")
-            print_item "Open Ports (UFW)" "ok" "$open_ports rules"
+            # Show open ports with details
+            if show_details; then
+                local open_ports=$(ufw status | grep "ALLOW" | grep -v "(v6)" | awk '{print $1}' | tr '\n' ' ')
+                [[ -n "$open_ports" ]] && print_detail "Allowed: ${open_ports}"
+            fi
         else
             print_item "UFW" "fail" "inactive"
             WARNINGS+=("UFW firewall is not active")
         fi
     else
         print_item "UFW" "warn" "not installed"
-    fi
-
-    # Check iptables rules count
-    if command -v iptables &> /dev/null; then
-        local ipt_rules=$(iptables -L -n 2>/dev/null | grep -c "^[A-Z]" || echo "0")
-        print_item "iptables" "ok" "$ipt_rules chains"
     fi
 }
 
@@ -273,7 +388,14 @@ check_compromise() {
         else
             print_item "SSH keys" "warn" "$key_count keys (review)"
             SUGGESTIONS+=("Review authorized SSH keys")
-            ((issues++)) || true || true
+            ((issues++)) || true
+        fi
+        # Show key comments (last field)
+        if show_details; then
+            grep "^ssh-" "$auth_keys" 2>/dev/null | while read -r line; do
+                local comment=$(extract_comment_from_key "$line")
+                print_detail "→ ${comment}"
+            done
         fi
     else
         print_item "SSH keys" "ok" "no keys file"
@@ -283,6 +405,18 @@ check_compromise() {
     local cron_jobs=$(crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" | wc -l)
     local system_crons=$(ls /etc/cron.d/ 2>/dev/null | grep -v "^\\." | wc -l)
     print_item "Cron jobs" "ok" "$cron_jobs user, $system_crons system"
+    # Show user cron details
+    if show_details && [[ "$cron_jobs" -gt 0 ]]; then
+        crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" | while read -r line; do
+            local cmd=$(extract_cron_command "$line")
+            print_detail "→ ${cmd}"
+        done
+    fi
+    # Show system cron names
+    if show_details && [[ "$system_crons" -gt 0 ]]; then
+        local cron_names=$(ls /etc/cron.d/ 2>/dev/null | grep -v "^\\." | tr '\n' ' ')
+        print_detail "System: ${cron_names}"
+    fi
 
     # Check for suspicious processes (crypto miners, etc.)
     local suspicious_procs=$(ps aux 2>/dev/null | grep -iE "(xmrig|minerd|cryptonight|stratum)" | grep -v grep | wc -l)
@@ -297,10 +431,60 @@ check_compromise() {
     # Check for unusual network connections
     local outbound=$(ss -tunap 2>/dev/null | grep ESTAB | grep -v "127.0.0.1\|::1" | wc -l)
     print_item "Outbound connections" "ok" "$outbound active"
+    # Show connection details
+    if show_details; then
+        ss -tunap 2>/dev/null | grep ESTAB | grep -v "127.0.0.1\|::1" | head -10 | while read -r line; do
+            local proc=$(extract_process_name "$line")
+            local remote=$(extract_remote_address "$line")
+            print_detail "→ ${proc} → ${remote}"
+        done
+
+        if [[ "$outbound" -gt 10 ]]; then
+            print_detail "   ... and $((outbound - 10)) more (use -v to see all)"
+        fi
+    fi
 
     # Check last logins for unusual IPs
     local unique_ips=$(last -ai 2>/dev/null | grep -v "reboot\|wtmp\|^$" | awk '{print $NF}' | sort -u | wc -l)
     print_item "Unique login IPs" "ok" "$unique_ips (last month)"
+
+    # Get top IPs with counts (limited to MAX_LOGIN_IPS_DISPLAY)
+    local top_ips=$(last -ai 2>/dev/null | grep -v "reboot\|wtmp\|^$" | \
+        awk '{print $NF}' | sort | uniq -c | sort -rn | head -${MAX_LOGIN_IPS_DISPLAY})
+
+    # Show top login IPs with optional GeoIP info
+    if show_verbose_details && [[ "$DISABLE_GEOIP" != "true" ]]; then
+        echo "$top_ips" | while read -r count ip; do
+            is_valid_ip "$ip" || continue
+
+            if geoinfo=$(get_cached_geoip "$ip"); then
+                local country=$(echo "$geoinfo" | grep -o '"country"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+                local city=$(echo "$geoinfo" | grep -o '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+                local org=$(sanitize_output "$(echo "$geoinfo" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)")
+
+                local tag=""
+                [[ "$count" -eq 1 ]] && tag=" [NEW]"
+
+                # Format: KR/City or just KR if no city
+                local location="${country}"
+                [[ -n "$city" ]] && location="${country}/${city}"
+
+                print_detail "→ ${ip} (${count}x) ${location}, ${org}${tag}"
+            else
+                print_detail "→ ${ip} (${count}x)"
+                if [[ "$GEOIP_ERROR_SHOWN" == "false" ]]; then
+                    print_detail "   (GeoIP lookup unavailable)"
+                    GEOIP_ERROR_SHOWN=true
+                fi
+            fi
+        done
+    elif show_details; then
+        # normal mode: show IPs without GeoIP
+        echo "$top_ips" | while read -r count ip; do
+            is_valid_ip "$ip" || continue
+            print_detail "→ ${ip} (${count}x)"
+        done
+    fi
 
     if [[ $issues -eq 0 ]]; then
         RESULTS[compromise]="clean"
@@ -339,6 +523,30 @@ check_updates() {
 #######################################
 
 main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -q|--quiet)
+                VERBOSITY="minimal"
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSITY="verbose"
+                shift
+                ;;
+            --no-geoip)
+                DISABLE_GEOIP=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
     # Check if running as root
     if [[ $EUID -ne 0 ]]; then
         echo -e "${YELLOW}Warning: Running without root. Some checks may be limited.${NC}"
